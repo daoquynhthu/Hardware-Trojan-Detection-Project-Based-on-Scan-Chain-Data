@@ -6,7 +6,7 @@ import lightgbm as lgb
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, jaccard_score
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.config import DATA_DIR
+from src.config import DATA_DIR, LGBM_PARAMS
 
 def evaluate_lodo():
     dataset_path = os.path.join(DATA_DIR, "dataset.pkl")
@@ -31,19 +31,7 @@ def evaluate_lodo():
     print(f"{'Design':<25} | {'Prec':<6} | {'Rec':<6} | {'F1':<6} | {'AUC':<6} | {'IoU':<6} | {'P@20':<6} | {'R@20':<6}")
     print("-" * 110)
     
-    params = {
-        'num_leaves': 48,
-        'learning_rate': 0.03,
-        'n_estimators': 2000,
-        'min_data_in_leaf': 20,
-        'feature_fraction': 0.8,
-        'bagging_fraction': 0.8,
-        'bagging_freq': 5,
-        'class_weight': {0:1, 1:50},
-        'objective': 'binary',
-        'verbose': -1,
-        'n_jobs': 1 # Avoid overloading if running many loops, or use -1
-    }
+    params = LGBM_PARAMS
     
     for d_id in unique_designs:
         d_id = int(d_id)

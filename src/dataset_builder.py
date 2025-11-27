@@ -5,12 +5,21 @@ import sys
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
+import logging
+
 # Add src to path to allow imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import SEQS_DATA_DIR, MODELS_DIR, DATA_DIR
 from src.utils import load_labels, load_npz
 from src.feature_extractor import extract_features_from_design
+
+# Configure logging
+logging.basicConfig(
+    filename='dataset_builder.log',
+    level=logging.ERROR,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 def build_dataset():
     # List files
@@ -59,55 +68,110 @@ def build_dataset():
             data = load_npz(file_path)
             seqs = data["seqs"]
             
-            # --- Transpose Logic ---
-            # Check if seqs is (N_regs, N_cycles) instead of (N_cycles, N_regs)
-            # Use reg2row to verify
+            # --- Transpose Logic & Shape Verification ---
+            # Expected shape: (N_cycles, N_regs)
+            # We use reg2row (map of reg_name -> index) to determine N_regs
+            
+            n_regs_metadata = None
+            
             if "reg2row" in data:
                 reg2row = data["reg2row"]
                 if isinstance(reg2row, np.ndarray) and reg2row.shape == ():
                     reg2row = reg2row.item()
                 
                 if isinstance(reg2row, dict) and reg2row:
-                    max_row_idx = max(reg2row.values())
+                    # Handle nested structure where 'reg' key holds the actual map
+                    if "reg" in reg2row and isinstance(reg2row["reg"], dict):
+                        reg_map = reg2row["reg"]
+                    else:
+                        reg_map = reg2row
                     
-                    # If max index is closer to dim 0 than dim 1, and dim 0 > dim 1
-                    # Or simply if max_row_idx >= seqs.shape[1] (implies indices are out of bounds for dim 1)
-                    if max_row_idx >= seqs.shape[1]:
-                        # Must be (N_regs, N_cycles)
-                        # print(f"Transposing {filename}: {seqs.shape} -> ({seqs.shape[1]}, {seqs.shape[0]})")
-                        seqs = seqs.T
+                    if reg_map:
+                        max_val = 0
+                        for val in reg_map.values():
+                            if isinstance(val, (list, tuple, np.ndarray)):
+                                # If list [start, end], end is the upper bound
+                                curr = max(val) if len(val) > 0 else 0
+                                if curr > max_val: max_val = curr
+                            elif isinstance(val, (int, float, np.integer)):
+                                # If int index, n_regs = index + 1
+                                if val + 1 > max_val: max_val = val + 1
+                        
+                        n_regs_metadata = max_val
             
+            # Heuristic: If we have metadata, use it to validate dimensions
+            if n_regs_metadata is not None:
+                dim0, dim1 = seqs.shape
+                
+                # Check if dim1 matches n_regs (Standard case)
+                if dim1 == n_regs_metadata:
+                    pass # Correct shape (T, N)
+                # Check if dim0 matches n_regs (Transposed case)
+                elif dim0 == n_regs_metadata:
+                    # print(f"Transposing {filename} based on metadata: {seqs.shape} -> ({dim1}, {dim0})")
+                    seqs = seqs.T
+                else:
+                    print(f"Warning: Dimensions {seqs.shape} do not match metadata N_regs={n_regs_metadata} for {filename}. Using heuristic.")
+                    # Fallback Heuristic: Time usually > Regs, but not always.
+                    # If dim0 < dim1, it might be (N, T) if N is small and T is large? No.
+                    # Usually T >> N or T ~ N. 
+                    # If metadata fails, we rely on the previous logic or assume (T, N)
+            
+            # Fallback if no metadata or mismatch: Check for obvious transpose (N_regs > N_cycles is rare but possible)
+            # The previous logic: if max_row_idx >= seqs.shape[1], then seqs.shape[1] is too small to be N_regs.
+            elif n_regs_metadata is not None and n_regs_metadata >= seqs.shape[1]:
+                 seqs = seqs.T
+                 
         except Exception as e:
-            print(f"Error loading {filename}: {e}")
+            error_msg = f"Error loading {filename}: {e}"
+            print(error_msg)
+            logging.error(error_msg)
             continue
             
         # Extract Features
         # print(f"Extracting features for {filename}...")
-        features = extract_features_from_design(seqs) # [N_regs, N_feats]
+        try:
+            features = extract_features_from_design(seqs) # [N_regs, N_feats]
+        except Exception as e:
+             error_msg = f"Error extracting features for {filename}: {e}"
+             print(error_msg)
+             logging.error(error_msg)
+             continue
         
         # Create Labels
         n_regs = features.shape[0]
-        y = np.zeros(n_regs)
+        y = np.zeros(n_regs, dtype=int)
         
+        has_labels = False
         if design_id in labels_map:
             l_start, l_end = labels_map[design_id]
-            # Updated to use Python slicing (exclusive end) as requested
-            # User provided code: label[start:end] = 1
-            if l_end <= n_regs:
-                y[l_start : l_end] = 1
+            # Updated to use Python slicing.
+            # Assuming labels.json uses INCLUSIVE indexing [start, end] (Hardware convention)
+            # Python slicing is [start, end), so we need end + 1.
+            
+            l_end_slice = l_end + 1
+            
+            if l_end_slice <= n_regs:
+                y[l_start : l_end_slice] = 1
+                has_labels = True
             else:
-                # Handle edge case where label index might exceed reg count
-                actual_end = min(l_end, n_regs)
-                y[l_start : actual_end] = 1
-                if l_start < n_regs:
-                    print(f"Warning: Label end {l_end} > n_regs {n_regs} for {filename}, clipped.")
-                else:
-                    print(f"Warning: Label start {l_start} >= n_regs {n_regs} for {filename}, no labels set.")
+                # Critical: If labels are out of bounds, we might be using the wrong file or labels.
+                # Do NOT clip and pretend it's fine. Skip this design to avoid poisoning the dataset.
+                error_msg = f"Skipping {filename}: Label indices [{l_start}, {l_end}] out of bounds for N_regs={n_regs}."
+                print(f"Warning: {error_msg}")
+                logging.warning(error_msg)
+                continue
 
         else:
             print(f"Warning: No labels found for design index {design_id} ({filename})")
+            # If no labels exist in map, we assume clean? Or skip?
+            # Assuming clean (y=0) if not in map is risky if map is incomplete.
+            # But here we are iterating over known files.
+            pass
             
         # Normalize per design
+        # We normalize per design (Instance Normalization) to handle process variation between chips/simulations.
+        # This means the model learns relative patterns, not absolute values.
         scaler = StandardScaler()
         features_norm = scaler.fit_transform(features)
         

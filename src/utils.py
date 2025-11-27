@@ -14,4 +14,4 @@ def load_labels():
         return json.load(f)
 
 def load_npz(path):
-    return np.load(path)
+    return np.load(path, allow_pickle=True)

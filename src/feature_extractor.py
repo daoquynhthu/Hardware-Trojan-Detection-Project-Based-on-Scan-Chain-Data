@@ -18,7 +18,8 @@ def extract_features_from_design(seqs):
     
     # 1. Global Statistics
     means = np.mean(seqs, axis=0)
-    variances = np.var(seqs, axis=0)
+    # Use ddof=1 for sample variance (N-1) to reduce bias
+    variances = np.var(seqs, axis=0, ddof=1)
     
     # Toggle rate
     diffs = np.diff(seqs, axis=0) # shape [N_cycles-1, N_regs]
@@ -27,7 +28,9 @@ def extract_features_from_design(seqs):
     
     # Entropy (Binary entropy based on probability of 1)
     # H(p) = -p log2 p - (1-p) log2 (1-p)
-    p = np.clip(means, 1e-9, 1 - 1e-9)
+    # Use relative threshold for stability
+    epsilon = 1e-9
+    p = np.clip(means, epsilon, 1 - epsilon)
     entropies = -p * np.log2(p) - (1-p) * np.log2(1-p)
     
     # Static Ratio: max(mean, 1-mean)
@@ -39,8 +42,9 @@ def extract_features_from_design(seqs):
     # For Neighbor Correlation Optimization
     # Normalize sequences: Z = (X - mean) / std
     # Avoid division by zero for constant registers
-    stds = np.sqrt(variances)
-    valid_std_mask = stds > 1e-9
+    # Use ddof=1 for sample std (N-1)
+    stds = np.std(seqs, axis=0, ddof=1)
+    valid_std_mask = stds > epsilon
     
     # Z_seqs shape: [N_cycles, N_regs]
     Z_seqs = np.zeros_like(seqs, dtype=float)
@@ -131,16 +135,25 @@ def extract_features_from_design(seqs):
         reg_feats.extend(probs)
         
         # --- 4.4 FFT Features ---
-        # Top 5 non-zero freq magnitudes (skipping DC)
+        # Top 5 strongest freq magnitudes (skipping DC)
         if n_cycles > 1:
             fft_vals = np.abs(np.array(fft(sig)))
             fft_vals = fft_vals[1:] # Skip DC
-            # Take first 5
-            if len(fft_vals) >= 5:
-                reg_feats.extend(fft_vals[:5])
+            
+            # Sort by magnitude (descending)
+            if len(fft_vals) > 0:
+                # Use partition for efficiency if array is large, or just sort
+                # We want top 5
+                k = min(5, len(fft_vals))
+                # indices of top k elements
+                top_k_idx = np.argsort(fft_vals)[-k:][::-1]
+                top_vals = fft_vals[top_k_idx]
+                
+                reg_feats.extend(top_vals)
+                if k < 5:
+                     reg_feats.extend([0] * (5 - k))
             else:
-                reg_feats.extend(fft_vals)
-                reg_feats.extend([0] * (5 - len(fft_vals)))
+                reg_feats.extend([0] * 5)
         else:
             reg_feats.extend([0] * 5)
             
@@ -161,7 +174,11 @@ def extract_features_from_design(seqs):
                     corr = 0
                 else:
                     z_j = Z_seqs[:, neighbor_idx]
-                    corr = np.dot(z_i, z_j) / n_cycles
+                    # Use n_cycles - 1 for unbiased estimator (Pearson correlation)
+                    if n_cycles > 1:
+                        corr = np.dot(z_i, z_j) / (n_cycles - 1)
+                    else:
+                        corr = 0
                 reg_feats.append(corr)
             else:
                 reg_feats.append(0)

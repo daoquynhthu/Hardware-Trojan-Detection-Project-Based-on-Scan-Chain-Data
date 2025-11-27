@@ -1,93 +1,143 @@
 import argparse
-import numpy as np
-import lightgbm as lgb
 import os
 import sys
-from sklearn.preprocessing import StandardScaler
+import pickle
+import numpy as np
+import pandas as pd
 
+# Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.config import MODEL_PATH
-from src.utils import load_npz
-from src.feature_extractor import extract_features_from_design
 
-def infer(npz_path, top_k=20, model_path=MODEL_PATH):
-    if not os.path.exists(npz_path):
-        print(f"Error: File {npz_path} not found.")
-        return
+from src.config import LGBM_MODEL_DIR, TRANSFORMER_MODEL_DIR
 
+def load_lgbm_model():
+    import lightgbm as lgb
+    model_path = os.path.join(LGBM_MODEL_DIR, "lgbm_model.txt")
     if not os.path.exists(model_path):
-        print(f"Error: Model {model_path} not found. Train model first.")
-        return
+        raise FileNotFoundError(f"LGBM model not found at {model_path}")
+    return lgb.Booster(model_file=model_path)
 
-    # Load Model
-    try:
-        bst = lgb.Booster(model_file=model_path)
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        return
-
-    print(f"Processing {npz_path}...")
-    try:
-        data = load_npz(npz_path)
-        seqs = data["seqs"]
-        # Try to get reg2row if it exists
-        if "reg2row" in data:
-            reg2row = data["reg2row"]
-        else:
-            reg2row = None
-    except Exception as e:
-        print(f"Error reading npz: {e}")
-        return
-
-    # Extract
-    print("Extracting features...")
-    feats = extract_features_from_design(seqs)
+def load_transformer_model(device):
+    import torch
+    from src.transformer.model import Transformer, ModelArgs
     
-    # Normalize (Fit on self - Instance Normalization)
-    print("Normalizing features...")
-    scaler = StandardScaler()
-    feats_norm = scaler.fit_transform(feats)
-    
-    # Predict
-    print("Predicting...")
-    # For binary classification, predict returns probability of class 1
-    scores = bst.predict(feats_norm)
-    # Fix: Ensure scores is numpy array
-    scores = np.array(scores)
-    
-    # Top K
-    idx_sorted = np.argsort(-scores)
-
-    top_indices = idx_sorted[:top_k]
-    top_scores = scores[top_indices]
-    
-    print(f"\nTop-{top_k} Suspicious Registers:")
-    print("-" * 50)
-    print(f"{'Rank':<5} | {'Index':<8} | {'Prob':<8} | {'Name'}")
-    print("-" * 50)
-    
-    # Inverse map reg2row if possible
-
-    row2name = {}
-    if reg2row is not None:
-        # Handle if reg2row is numpy 0-d array containing dict
-        if isinstance(reg2row, np.ndarray) and reg2row.shape == ():
-            reg2row = reg2row.item()
+    model_path = os.path.join(TRANSFORMER_MODEL_DIR, "best_model.pth")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Transformer model not found at {model_path}")
         
-        if isinstance(reg2row, dict):
-            row2name = {v: k for k, v in reg2row.items()}
+    # Assuming default args for now. Ideally, load these from a config file saved with the model.
+    model_args = ModelArgs(
+        dim=128,
+        n_layers=2,
+        n_heads=4,
+        max_seq_len=1024,
+        input_dim=35, # Default based on current dataset
+        num_classes=2,
+        dropout=0.0 # No dropout for inference
+    )
+    
+    model = Transformer(model_args).to(device)
+    
+    # Load state dict
+    try:
+        model.load_state_dict(torch.load(model_path, map_location=device))
+    except Exception as e:
+        print(f"Error loading model state dict: {e}")
+        print("Attempting strict=False...")
+        model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
+        
+    model.eval()
+    return model
+
+def infer_lgbm(model, X):
+    # X shape: (N, features)
+    y_pred = model.predict(X)
+    return y_pred
+
+def infer_transformer(model, X, device):
+    import torch
+    
+    max_len = 1024
+    N = X.shape[0]
+    preds = []
+    
+    with torch.no_grad():
+        for start in range(0, N, max_len):
+            end = min(start + max_len, N)
+            chunk = X[start:end]
             
-    for rank, (idx, score) in enumerate(zip(top_indices, top_scores)):
-        name = row2name.get(idx, "N/A")
-        print(f"{rank+1:<5} | {idx:<8} | {score:.4f}   | {name}")
-        
-    return top_indices, top_scores
+            # Pad if necessary
+            original_len = chunk.shape[0]
+            if original_len < max_len:
+                pad_len = max_len - original_len
+                chunk = np.vstack([chunk, np.zeros((pad_len, chunk.shape[1]))])
+            
+            chunk_tensor = torch.tensor(chunk, dtype=torch.float32).unsqueeze(0).to(device) # Batch size 1
+            output = model(chunk_tensor) # (1, 1024, 2)
+            probs = torch.softmax(output, dim=-1)[:, :, 1] # (1, 1024)
+            
+            # Extract valid predictions
+            chunk_probs = probs[0, :original_len].cpu().numpy()
+            preds.extend(chunk_probs)
+            
+    return np.array(preds)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--file", type=str, required=True, help="Path to .npz file")
-    parser.add_argument("--top_k", type=int, default=20, help="Number of top suspicious registers")
-    parser.add_argument("--model", type=str, default=MODEL_PATH, help="Path to model file")
+def main():
+    parser = argparse.ArgumentParser(description="Inference for HT Detector")
+    parser.add_argument("--model", type=str, required=True, choices=["lgbm", "transformer"], help="Model type to use")
+    parser.add_argument("--input", type=str, required=True, help="Path to input data (.pkl or .npy)")
+    parser.add_argument("--output", type=str, required=True, help="Path to save predictions (.npy)")
     
     args = parser.parse_args()
-    infer(args.file, args.top_k, args.model)
+    
+    # Load data
+    print(f"Loading data from {args.input}...")
+    if args.input.endswith(".pkl"):
+        with open(args.input, "rb") as f:
+            data = pickle.load(f)
+            if isinstance(data, dict) and "X" in data:
+                X = data["X"]
+            else:
+                X = data
+    elif args.input.endswith(".npy"):
+        X = np.load(args.input)
+    else:
+        print("Error: Unsupported file format. Use .pkl or .npy")
+        return
+
+    # Ensure X is 2D
+    if len(X.shape) != 2:
+        print(f"Error: Expected 2D input (N, features), got {X.shape}")
+        return
+        
+    print(f"Data shape: {X.shape}")
+    
+    if args.model == "lgbm":
+        print("Loading LightGBM model...")
+        try:
+            model = load_lgbm_model()
+            print("Running inference...")
+            preds = infer_lgbm(model, X)
+        except Exception as e:
+            print(f"Error running LightGBM inference: {e}")
+            return
+        
+    elif args.model == "transformer":
+        import torch
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Loading Transformer model on {device}...")
+        try:
+            model = load_transformer_model(device)
+            print("Running inference...")
+            preds = infer_transformer(model, X, device)
+        except Exception as e:
+            print(f"Error running Transformer inference: {e}")
+            return
+        
+    # Save results
+    print(f"Saving results to {args.output}...")
+    np.save(args.output, preds)
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
