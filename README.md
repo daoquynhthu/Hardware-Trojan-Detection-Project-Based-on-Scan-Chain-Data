@@ -64,4 +64,4 @@ python src/evaluate.py
 ```bash
 python src/infer.py --file data/seqs_data/aes-t1200-aes_trojan_comb.npz --top_k 20
 ```
-对指定设计文件进行推理，输出最可疑的前 20 个寄存器。
+对指定设计文件进行推理，输出长度 N 的寄存器概率向量 p[i]。
