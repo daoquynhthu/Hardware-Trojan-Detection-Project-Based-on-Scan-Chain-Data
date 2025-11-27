@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.ipynb_checkpoints/
+.vscode/
+.idea/
+*.log
+data/dataset.pkl
+models/lgbm_model.txt
+models/scalers/*.pkl
