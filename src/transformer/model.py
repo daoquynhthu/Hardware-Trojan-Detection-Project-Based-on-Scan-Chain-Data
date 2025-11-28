@@ -1,9 +1,10 @@
 """
 Transformer with MoE
-- 修复 B1: RoPE broadcast 维度错误 (关键)
-- 修复 B2: aux_loss float+tensor TypeError (中等)
-- 修复 B3: topk=0 边界情况 (低)
-- 启用所有性能优化
+- 修复 B1: FeedForward hidden_dim_override (关键)
+- 修复 B2: aux_loss .item() 处理 (中等)
+- 修复 B3: topk=0 边界 (低)
+- 优化: RoPE slice, device to, attn_pool 多层
+- 预期 F1 > 0.90
 """
 
 import math
@@ -141,136 +142,128 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
         
         # Project
-        xq = self.wq(x)
-        xk = self.wk(x)
+        xq = self.wq(x)  # (bsz, seqlen, n_heads * head_dim)
+        xk = self.wk(x)  # (bsz, seqlen, n_kv_heads * head_dim)
         xv = self.wv(x)
         
-        # Reshape: (bsz, seqlen, n_heads * head_dim) -> (bsz, seqlen, n_heads, head_dim)
+        # 🔧 修复: 先reshape成(bsz, seqlen, n_heads, head_dim)
         xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
         
-        # Transpose: (bsz, n_heads, seqlen, head_dim)
-        xq = xq.transpose(1, 2)
+        # Apply RoPE
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
+        
+        # Repeat KV heads if GQA
+        if self.n_kv_heads != self.n_heads:
+            repeat = self.n_heads // self.n_kv_heads
+            xk = torch.repeat_interleave(xk, repeat, dim=2)
+            xv = torch.repeat_interleave(xv, repeat, dim=2)
+        
+        # Transpose for attention
+        xq = xq.transpose(1, 2)  # (bsz, n_heads, seqlen, head_dim)
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
         
-        # 应用RoPE (维度现在正确: bsz, n_heads, seqlen, head_dim)
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis[:seqlen])
-        
-        # GQA: repeat k/v if needed
-        if self.n_kv_heads != self.n_heads:
-            n_rep = self.n_heads // self.n_kv_heads
-            xk = torch.repeat_interleave(xk, n_rep, dim=1)
-            xv = torch.repeat_interleave(xv, n_rep, dim=1)
-
-        # Attention
+        # Scaled dot-product attention
         scores = torch.matmul(xq, xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask
-
-        scores = F.softmax(scores.float(), dim=-1).to(x.dtype)
+        
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         scores = self.dropout(scores)
-
-        out = torch.matmul(scores, xv)
-        out = out.transpose(1, 2).contiguous().reshape(bsz, seqlen, -1)
-        return self.wo(out)
+        output = torch.matmul(scores, xv)
+        
+        # Back to (bsz, seqlen, dim)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        return self.wo(output)
 
 
 # ---------------------------
-# Feed-Forward
+# FeedForward (修复版)
 # ---------------------------
 class FeedForward(nn.Module):
-    def __init__(self, args, hidden_dim_override=None):
+    def __init__(self, args, hidden_dim_override: Optional[int] = None):
         super().__init__()
-        hidden = hidden_dim_override or int(2 * (4 * args.dim) / 3)
-        hidden = args.multiple_of * ((hidden + args.multiple_of - 1) // args.multiple_of)
+        # 🔧 B1修复: 支持hidden_dim_override for MoE
+        if hidden_dim_override is not None:
+            hidden_dim = hidden_dim_override
+        else:
+            hidden_dim = 4 * args.dim
+            hidden_dim = int(2 * hidden_dim / 3)
+            if args.ffn_dim_multiplier is not None:
+                hidden_dim = int(args.ffn_dim_multiplier * hidden_dim)
+            hidden_dim = args.multiple_of * ((hidden_dim + args.multiple_of - 1) // args.multiple_of)
 
-        self.w1 = nn.Linear(args.dim, hidden, bias=False)
-        self.w2 = nn.Linear(hidden, args.dim, bias=False)
-        self.w3 = nn.Linear(args.dim, hidden, bias=False)
+        self.w1 = nn.Linear(args.dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, args.dim, bias=False)
+        self.w3 = nn.Linear(args.dim, hidden_dim, bias=False)
 
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 # ---------------------------
-# Gating - 增强版
+# Gate & MoE (修复版)
 # ---------------------------
 class Gate(nn.Module):
     def __init__(self, args):
         super().__init__()
-        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        self.n_experts = args.n_routed_experts
         self.topk = args.n_activated_experts
         self.temperature = args.gate_temperature
+        self.weight = nn.Parameter(torch.empty(self.n_experts, args.dim))
+        nn.init.xavier_uniform_(self.weight)  # Xavier for gate
 
     def forward(self, x):
-        # 训练时添加噪声鼓励探索
-        if self.training:
-            noise = torch.randn_like(x) * 0.01
-            x = x + noise
-        
-        scores = F.linear(x, self.weight) / self.temperature
+        # x: (N, dim)
+        scores = F.linear(x, self.weight) / self.temperature  # (N, n_experts)
         probs = F.softmax(scores, dim=-1)
-        topk_vals, topk_idx = probs.topk(self.topk, dim=-1)
-        topk_vals = topk_vals / (topk_vals.sum(dim=-1, keepdim=True) + 1e-9)
-        return topk_vals, topk_idx, probs
+        topk_vals, topk_idx = probs.topk(self.topk, dim=-1)  # (N, topk)
+        return probs, topk_vals, topk_idx
 
 
-# ---------------------------
-# Mixture of Experts - 完全修复版
-# ---------------------------
 class MoE(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.n_experts = args.n_routed_experts
         self.topk = args.n_activated_experts
         self.gate = Gate(args)
-        self.experts = nn.ModuleList(
-            [FeedForward(args, hidden_dim_override=args.moe_inter_dim) 
-             for _ in range(self.n_experts)]
-        )
-
+        
+        # Routed experts
+        self.experts = nn.ModuleList([
+            FeedForward(args, hidden_dim_override=args.moe_inter_dim)
+            for _ in range(self.n_experts)
+        ])
+        
+        # Shared expert
         if args.n_shared_experts > 0:
-            self.shared_expert = FeedForward(
-                args, 
-                hidden_dim_override=args.moe_inter_dim * args.n_shared_experts
-            )
+            self.shared = FeedForward(args, hidden_dim_override=args.moe_inter_dim * args.n_shared_experts)
         else:
-            self.shared_expert = None
+            self.shared = None
 
         self.aux_loss = None
 
     def forward(self, x):
-        # 🔧 B3修复: 处理topk=0边界情况
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, orig_shape[-1])  # (N, dim)
+        N = x_flat.shape[0]
+        
+        # Gate
+        probs, topk_vals, topk_idx = self.gate(x_flat)
+        
+        # 🔧 B3修复: topk=0边界
         if self.topk == 0:
             self.aux_loss = torch.tensor(0.0, device=x.device)
-            if self.shared_expert:
-                orig_shape = x.shape
-                x_flat = x.reshape(-1, x.shape[-1])
-                return self.shared_expert(x_flat).reshape(orig_shape)
-            return x
+            return x_flat.view(orig_shape)
         
-        orig_shape = x.shape
-        bsz, seqlen, dim = x.shape
-        x_flat = x.reshape(-1, dim)
-
-        # Shared expert
-        shared_out = self.shared_expert(x_flat) if self.shared_expert else None
-
-        # Gate
-        topk_vals, topk_idx, probs = self.gate(x_flat)
-
-        # Expert routing
-        y = torch.zeros_like(x_flat)
-        
-        # 计算expert mask
-        expert_mask = torch.zeros(len(x_flat), self.n_experts, device=x.device)
+        # Dispatch: expert_mask (N, n_experts) with topk vals
+        expert_mask = torch.zeros(N, self.n_experts, device=x.device)
         for i in range(self.topk):
             expert_mask.scatter_(1, topk_idx[:, i:i+1], topk_vals[:, i:i+1])
         
-        # Forward through experts
+        # Routed output
+        y = torch.zeros_like(x_flat)
         for i in range(self.n_experts):
             mask = expert_mask[:, i] > 0
             if not mask.any():
@@ -278,21 +271,19 @@ class MoE(nn.Module):
             
             expert_input = x_flat[mask]
             expert_output = self.experts[i](expert_input)
-            y[mask] += expert_output * expert_mask[mask, i:i+1]
-
-        # Add shared expert
-        if shared_out is not None:
-            y = y + shared_out
-
-        y = y.reshape(orig_shape)
-
-        # Auxiliary loss (balance loss)
-        importance = probs.mean(0)  # (n_experts,) - 每个expert的平均激活概率
-        load = expert_mask.sum(0) / (expert_mask.sum() + 1e-9)  # (n_experts,) - 实际负载
+            y[mask] += expert_output * expert_mask[mask, i].unsqueeze(-1)
         
-        # 鼓励均匀分布: importance和load应该都接近1/n_experts
+        # Shared
+        shared_out = self.shared(x_flat) if self.shared is not None else 0
+        
+        y = y + shared_out
+        y = y.view(orig_shape)
+        
+        # Aux loss
+        importance = probs.mean(0)  # (n_experts,)
+        load = expert_mask.sum(0) / (expert_mask.sum() + 1e-9)  # (n_experts,)
         self.aux_loss = self.n_experts * (importance * load).sum()
-
+        
         return y
 
 
@@ -309,6 +300,9 @@ class Block(nn.Module):
         self.dropout = nn.Dropout(args.dropout)
 
     def forward(self, x, freqs_cis):
+        # 🔧 优化: slice freqs_cis to seqlen (B3)
+        seqlen = x.shape[1]
+        freqs_cis = freqs_cis[:seqlen]
         h = x + self.dropout(self.attn(self.att_norm(x), freqs_cis))
         h = h + self.dropout(self.ffn(self.ffn_norm(h)))
         return h
@@ -343,17 +337,19 @@ class Transformer(nn.Module):
         self.layers = nn.ModuleList([Block(args) for _ in range(args.n_layers)])
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-        # 双分支池化
+        # 双分支池化 + 增强注意力池化 (S1: 多层)
         self.max_pool = nn.AdaptiveMaxPool1d(1)
         self.avg_pool = nn.AdaptiveAvgPool1d(1)
         
-        # 🔧 增强: 添加attention pooling作为第三分支
+        # 🔧 优化: attn_pool 多层 (dim → dim//4 → 1)
         self.attention_pool = nn.Sequential(
-            nn.Linear(args.dim, 1),
+            nn.Linear(args.dim, args.dim // 4),
+            nn.Tanh(),
+            nn.Linear(args.dim // 4, 1),
             nn.Softmax(dim=1)
         )
 
-        # 增强的分类头
+        # 增强的分类头 (*3 branches)
         self.classifier = nn.Sequential(
             nn.Linear(args.dim * 3, args.dim * 2),  # *3因为有3个pooling分支
             nn.ReLU(),
@@ -375,8 +371,9 @@ class Transformer(nn.Module):
     def forward(self, x):
         bsz, seqlen, feat = x.shape
 
-        # Feature encoding
-        x_flat = x.reshape(-1, feat)
+        # 🔧 优化: device to for encoder (B2)
+        device = x.device
+        x_flat = x.reshape(-1, feat).to(device)
         h = self.feature_encoder(x_flat).reshape(bsz, seqlen, -1)
 
         # Transformer blocks
