@@ -6,9 +6,28 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 # Handle PyTorch AMP compatibility
 # Define dummy classes first with unique names to avoid linter confusion
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, weight=None, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.weight = weight
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        else:
+            return focal_loss.sum()
+
 class _CpuGradScaler:
     def __init__(self, enabled=False): pass
     def scale(self, loss): return loss
@@ -79,9 +98,11 @@ class SequenceDataset(Dataset):
         self.augment = augment
         # Use updated DataAugmenter params if possible, or defaults
         aug_config = config.get('augmentation', {})
+        
         self.augmenter = DataAugmenter(
             noise_std=aug_config.get('noise_std', 0.01), 
-            scale_range=(aug_config.get('scale_range_min', 0.95), aug_config.get('scale_range_max', 1.05))
+            scale_range=(aug_config.get('scale_range_min', 0.95), aug_config.get('scale_range_max', 1.05)),
+            mask_prob=aug_config.get('mask_prob', 0.05)
         ) if augment else None
         
         unique_designs = np.unique(design_ids)
@@ -92,19 +113,38 @@ class SequenceDataset(Dataset):
             y_design = y[mask]
             
             N = X_design.shape[0]
-            # Sliding window with 50% overlap
-            stride = self.max_len // 2
             
-            for start in range(0, N, stride):
-                end = min(start + self.max_len, N)
-                chunk_x = X_design[start:end]
-                chunk_y = y_design[start:end]
+            # DYNAMIC STRIDING (Dense Sampling for Rare Events)
+            # Instead of fixed stride, we step through.
+            # If the UPCOMING window contains a Trojan, we take a SMALL step (generate many overlaps).
+            # If the UPCOMING window is clean, we take a LARGE step (reduce background noise).
+            
+            cursor = 0
+            while cursor < N:
+                # Look ahead
+                end = min(cursor + self.max_len, N)
+                chunk_y = y_design[cursor:end]
+                
+                has_trojan = np.any(chunk_y == 1)
+                
+                # Determine step size for NEXT iteration
+                if has_trojan and self.augment: 
+                    # Training mode + Trojan detected: Dense Sampling
+                    # Step size 16 means (512-16)/512 = 97% overlap
+                    # This turns 1 sequence into ~30 sequences
+                    step = 16 
+                elif has_trojan and not self.augment:
+                    # Test mode + Trojan: Regular stride to ensure we catch it, but don't over-evaluate
+                    step = self.max_len // 2 
+                else:
+                    # Clean sequence: Standard stride
+                    step = self.max_len // 2
+                
+                # Extract Window
+                chunk_x = X_design[cursor:end]
                 
                 # Sequence-level label: 1 if any token is 1, else 0
-                # Ignore -100 padding (handled in __getitem__ but label is set here for oversampling check)
-                # Actually, y_design here is raw tokens. -100 is not yet applied (padding logic below).
-                # But dataset.pkl y is likely raw 0/1.
-                seq_label = 1 if np.any(chunk_y == 1) else 0
+                seq_label = 1 if has_trojan else 0
 
                 # Pad if necessary
                 if chunk_x.shape[0] < self.max_len:
@@ -116,16 +156,16 @@ class SequenceDataset(Dataset):
                 self.samples.append(chunk_x)
                 self.labels.append(chunk_y)
                 
-                # Oversampling for Trojan samples (Augmentation at dataset creation time)
-                # Note: This is different from __getitem__ augmentation.
-                # Here we add *more samples* to the list.
+                # In-memory Augmentation (Mixup/Noise copies)
                 if seq_label == 1 and augment and self.augmenter:
-                    # Add 4 augmented copies -> Total 5 samples (1 original + 4 augmented)
-                    # Increased from 2 to 4 to handle data imbalance and volume
-                    for _ in range(4):
+                    # Add 2 extra noisy copies even with dense sampling
+                    for _ in range(2):
                         augmented_x = self.augmenter.augment(chunk_x.copy())
                         self.samples.append(augmented_x)
-                        self.labels.append(chunk_y) # Label remains same
+                        self.labels.append(chunk_y)
+                
+                cursor += step
+                if cursor >= N: break
                         
         self.samples = np.array(self.samples, dtype=np.float32)
         self.labels = np.array(self.labels, dtype=np.longlong)
@@ -247,9 +287,15 @@ def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids, config):
     # Calculate Sequence-level class weights for Loss
     pos_weight_val = config['training'].get('pos_weight', [1.0, 5.0])
     pos_weight = torch.tensor(pos_weight_val, device=device)
-    print(f"Using CrossEntropyLoss weights: {pos_weight}")
+    label_smoothing = config['training'].get('label_smoothing', 0.0)
     
-    criterion = nn.CrossEntropyLoss(weight=pos_weight).to(device)
+    if config['training'].get('use_focal_loss', False):
+        gamma = config['training'].get('focal_gamma', 2.0)
+        print(f"Using Focal Loss (gamma={gamma}, weights={pos_weight})")
+        criterion = FocalLoss(gamma=gamma, weight=pos_weight).to(device)
+    else:
+        print(f"Using CrossEntropyLoss weights: {pos_weight}, Label Smoothing: {label_smoothing}")
+        criterion = nn.CrossEntropyLoss(weight=pos_weight, label_smoothing=label_smoothing).to(device)
 
     # optimizer
     optimizer = optim.AdamW(model.parameters(), lr=config['training']['lr'], weight_decay=config['training']['weight_decay'])
@@ -378,17 +424,16 @@ def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids, config):
                     'threshold': best_threshold
                 }
                 
-                # Only save model for the first fold to have a "best" artifact on disk
-                if fold_idx == 0:
-                    save_path = os.path.join(TRANSFORMER_MODEL_DIR, "best_model.pth")
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'f1': best_f1,
-                        'model_args': model_args,
-                        'threshold': best_threshold # Save threshold for inference
-                    }, save_path)
+                # Save best model for THIS fold
+                fold_save_path = os.path.join(TRANSFORMER_MODEL_DIR, f"model_fold_{fold_idx+1}.pth")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'f1': best_f1,
+                    'model_args': model_args,
+                    'threshold': best_threshold
+                }, fold_save_path)
             else:
                 patience_counter += 1
                 
@@ -425,9 +470,36 @@ def train_model():
     unique_designs = np.unique(design_ids)
     print(f"Total Designs: {len(unique_designs)}")
     
-    # 3-Fold Cross Validation
-    kf = KFold(n_splits=3, shuffle=True, random_state=42)
+    # --- CUSTOM BALANCED SPLIT ---
+    # Goal: Distribute Trojan-heavy designs evenly across folds
+    # 1. Calculate Trojan count per design
+    design_counts = []
+    for d in unique_designs:
+        mask = design_ids == d
+        count = np.sum(y[mask] == 1)
+        design_counts.append((d, count))
     
+    # 2. Sort by count descending (Heavy hitters first)
+    design_counts.sort(key=lambda x: x[1], reverse=True)
+    print("\nDesign Trojan Counts (Sorted):")
+    for d, c in design_counts:
+        print(f"  Design {d}: {c}")
+        
+    # 3. Distribute into 3 buckets (Greedy partition)
+    n_folds = 3
+    folds = [[] for _ in range(n_folds)]
+    fold_trojan_sums = [0] * n_folds
+    
+    for d, c in design_counts:
+        # Assign to the bucket with the fewest Trojans so far
+        min_idx = np.argmin(fold_trojan_sums)
+        folds[min_idx].append(d)
+        fold_trojan_sums[min_idx] += c
+        
+    print("\nBalanced Split Plan:")
+    for i in range(n_folds):
+        print(f"  Fold {i+1}: Designs {folds[i]} (Total Trojans: {fold_trojan_sums[i]})")
+        
     # Load config
     config_path = os.path.join(os.path.dirname(__file__), 'train_config.json')
     if os.path.exists(config_path):
@@ -451,9 +523,19 @@ def train_model():
 
     fold_results = []
     
-    for fold_idx, (train_idx, test_idx) in enumerate(kf.split(unique_designs)):
-        train_designs = unique_designs[train_idx]
-        test_designs = unique_designs[test_idx]
+    # Convert folds to numpy for indexing logic
+    # Actually, we just iterate our pre-calculated folds
+    
+    for fold_idx in range(n_folds):
+        # Test set is the current fold's bucket
+        test_designs = np.array(folds[fold_idx])
+        
+        # Train set is everything else
+        train_designs = []
+        for other_idx in range(n_folds):
+            if other_idx != fold_idx:
+                train_designs.extend(folds[other_idx])
+        train_designs = np.array(train_designs)
         
         metrics = train_fold(fold_idx, train_designs, test_designs, X, y, design_ids, config)
         if metrics:
@@ -471,6 +553,21 @@ def train_model():
     total_cm = np.sum(np.array([r['cm'] for r in fold_results]), axis=0)
     print("Aggregated Confusion Matrix:")
     print(total_cm)
+
+    # Identify Best Fold and Save as best_model.pth
+    if fold_results:
+        best_fold_idx = np.argmax(f1_scores)
+        print(f"\nBest Fold was Fold {best_fold_idx+1} with F1: {f1_scores[best_fold_idx]:.4f}")
+        
+        src_path = os.path.join(TRANSFORMER_MODEL_DIR, f"model_fold_{best_fold_idx+1}.pth")
+        dst_path = os.path.join(TRANSFORMER_MODEL_DIR, "best_model.pth")
+        
+        if os.path.exists(src_path):
+            import shutil
+            shutil.copy2(src_path, dst_path)
+            print(f"Saved Best Global Model to {dst_path}")
+        else:
+            print(f"Warning: Could not find source model file {src_path}")
 
 if __name__ == "__main__":
     train_model()
