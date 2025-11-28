@@ -58,7 +58,15 @@ class SequenceDataset(Dataset):
 
     def __getitem__(self, idx):
         x = self.samples[idx]
-        y = self.labels[idx]
+        y_seq = self.labels[idx]
+        
+        # Sequence-level label: 1 if any token is 1, else 0
+        # Ignore -100 padding
+        valid_mask = y_seq != -100
+        if np.any(valid_mask):
+             y = 1 if np.any(y_seq[valid_mask] == 1) else 0
+        else:
+             y = 0
         
         if self.augment and self.augmenter:
             x = self.augmenter.augment(x)
@@ -84,9 +92,7 @@ def train_model():
     
     # 分析类别分布
     unique, counts = np.unique(y, return_counts=True)
-    print(f"Label distribution: {dict(zip(unique, counts))}")
-    trojan_ratio = counts[1] / counts[0] if len(counts) > 1 else 0
-    print(f"Trojan/Normal ratio: {trojan_ratio:.4f}")
+    print(f"Original Token Label distribution: {dict(zip(unique, counts))}")
     
     # Split designs
     unique_designs = np.unique(design_ids)
@@ -110,19 +116,17 @@ def train_model():
     max_len = 512
     batch_size = 16
     
-    # 启用数据增强，但不要太激进
+    # 启用数据增强
     train_dataset = SequenceDataset(X_train, y_train, id_train, max_len=max_len, augment=True)
     test_dataset = SequenceDataset(X_test, y_test, id_test, max_len=max_len, augment=False)
     
-    # 使用 WeightedRandomSampler 来处理类别不平衡
-    # 确保每个 Batch 中包含 Trojan 的样本和不包含的样本比例均衡
+    # 使用 WeightedRandomSampler
     trojan_indices = np.where(train_dataset.has_trojan)[0]
     normal_indices = np.where(~train_dataset.has_trojan)[0]
     
-    print(f"Trojan sequences: {len(trojan_indices)}, Normal sequences: {len(normal_indices)}")
+    print(f"Sequence Stats - Trojan: {len(trojan_indices)}, Normal: {len(normal_indices)}")
     
     weights = np.zeros(len(train_dataset))
-    # 给予 Trojan 样本更高的权重，使得它们被采样的概率与 Normal 样本相当
     if len(trojan_indices) > 0:
         weights[trojan_indices] = 0.5 / len(trojan_indices)
         weights[normal_indices] = 0.5 / len(normal_indices)
@@ -149,7 +153,7 @@ def train_model():
     
     model_args = ModelArgs(
         dim=128,
-        n_layers=2, # 回到 2 层以加快收敛和避免过拟合
+        n_layers=2, 
         n_heads=4,
         max_seq_len=max_len,
         input_dim=X.shape[1],
@@ -158,34 +162,29 @@ def train_model():
     )
     model = Transformer(model_args).to(device)
     
-    # 计算 Token 级别的类别权重
-    # 虽然 Sampler 平衡了序列，但序列内部大部分是 Normal Token
-    print("Calculating token-level class weights...")
-    all_train_labels = np.concatenate([y for _, y in train_dataset])
-    valid_mask = all_train_labels != -100
-    valid_labels = all_train_labels[valid_mask]
-    n_neg = (valid_labels == 0).sum()
-    n_pos = (valid_labels == 1).sum()
+    # Calculate Sequence-level class weights for Loss
+    n_pos = len(trojan_indices)
+    n_neg = len(normal_indices)
     
     if n_pos > 0:
         pos_weight = n_neg / n_pos
-        print(f"Token stats: Neg={n_neg}, Pos={n_pos}, Calculated Pos Weight={pos_weight:.2f}")
-        # 为了稳定性，可以限制最大权重，例如 100
-        pos_weight = min(pos_weight, 100.0) 
+        print(f"Seq stats: Neg={n_neg}, Pos={n_pos}, Calculated Pos Weight={pos_weight:.2f}")
+        # 既然已经用了 Sampler，Loss 里的权重可以给小一点，或者干脆不用
+        # 但为了保险，还是给一点权重，特别是如果 Sampler 有时候采不到足够的样本
+        pos_weight = min(pos_weight, 5.0) 
     else:
-        print("Warning: No positive tokens in training set!")
         pos_weight = 1.0
         
-    token_class_weights = torch.tensor([1.0, float(pos_weight)], device=device)
-    print(f"Using CrossEntropyLoss weights: {token_class_weights}")
+    seq_class_weights = torch.tensor([1.0, float(pos_weight)], device=device)
+    print(f"Using CrossEntropyLoss weights: {seq_class_weights}")
     
-    criterion = nn.CrossEntropyLoss(weight=token_class_weights, ignore_index=-100).to(device)
+    criterion = nn.CrossEntropyLoss(weight=seq_class_weights).to(device)
 
     # optimizer
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
     
     use_cuda = torch.cuda.is_available()
-    scaler = GradScaler(enabled=use_cuda) # 使用默认参数
+    scaler = GradScaler(enabled=use_cuda) 
     
     epochs = 100
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
@@ -193,7 +192,7 @@ def train_model():
     patience = 20
     patience_counter = 0
     
-    # Initialize metric containers for final evaluation scope
+    # Initialize metric containers
     all_preds = []
     all_labels = []
     
@@ -208,8 +207,8 @@ def train_model():
             
             if use_cuda:
                 with autocast():
-                    output = model(data)
-                    loss = criterion(output.view(-1, 2), target.view(-1))
+                    output = model(data) # (bsz, 2)
+                    loss = criterion(output, target)
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -217,7 +216,7 @@ def train_model():
                 scaler.update()
             else:
                 output = model(data)
-                loss = criterion(output.view(-1, 2), target.view(-1))
+                loss = criterion(output, target)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -237,19 +236,15 @@ def train_model():
             for data, target in test_loader:
                 data, target = data.to(device), target.to(device)
                 output = model(data)
-                loss = criterion(output.view(-1, 2), target.view(-1))
+                loss = criterion(output, target)
                 val_loss += loss.item()
 
-                # Mask out padding
-                mask = target.view(-1) != -100
-                if mask.sum() > 0:
-                    probs = torch.softmax(output.view(-1, 2), dim=1)[mask]
-                    preds = torch.argmax(probs, dim=1)
-                    labels = target.view(-1)[mask]
-                    
-                    all_preds.extend(preds.cpu().numpy())
-                    all_labels.extend(labels.cpu().numpy())
-                    all_probs.extend(probs[:, 1].cpu().numpy())
+                probs = torch.softmax(output, dim=1)
+                preds = torch.argmax(probs, dim=1)
+                
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(target.cpu().numpy())
+                all_probs.extend(probs[:, 1].cpu().numpy())
 
         avg_val_loss = val_loss / len(test_loader) if len(test_loader) > 0 else 0
         

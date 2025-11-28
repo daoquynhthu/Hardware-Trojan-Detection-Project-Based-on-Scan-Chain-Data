@@ -157,5 +157,11 @@ class Transformer(nn.Module):
             h = layer(h, freqs_cis, mask=None) # No mask for bidirectional context or full sequence
             
         h = self.norm(h)
-        logits = self.output(h) # (bsz, seqlen, num_classes)
+        
+        # Sequence-level classification pooling
+        # Use Max pooling to detect if ANY part of the sequence has a Trojan signature
+        # This fits the anomaly detection nature of the task better than Mean pooling
+        h = h.max(dim=1)[0] # (bsz, dim)
+        
+        logits = self.output(h) # (bsz, num_classes)
         return logits
