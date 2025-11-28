@@ -21,6 +21,13 @@ class ModelArgs:
     input_dim: int = 35 # Adjusted for our dataset
     num_classes: int = 2 # Normal, Trojan
     dropout: float = 0.1
+    
+    # MoE Args
+    use_moe: bool = True # Enable MoE
+    n_routed_experts: int = 8
+    n_activated_experts: int = 2
+    n_shared_experts: int = 1
+    moe_inter_dim: int = 128 # Smaller hidden dim for experts
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -93,13 +100,16 @@ class Attention(nn.Module):
         return self.wo(output)
 
 class FeedForward(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, hidden_dim_override: Optional[int] = None):
         super().__init__()
-        hidden_dim = 4 * args.dim
-        hidden_dim = int(2 * hidden_dim / 3)
-        if args.ffn_dim_multiplier is not None:
-            hidden_dim = int(args.ffn_dim_multiplier * hidden_dim)
-        hidden_dim = args.multiple_of * ((hidden_dim + args.multiple_of - 1) // args.multiple_of)
+        if hidden_dim_override is not None:
+            hidden_dim = hidden_dim_override
+        else:
+            hidden_dim = 4 * args.dim
+            hidden_dim = int(2 * hidden_dim / 3)
+            if args.ffn_dim_multiplier is not None:
+                hidden_dim = int(args.ffn_dim_multiplier * hidden_dim)
+            hidden_dim = args.multiple_of * ((hidden_dim + args.multiple_of - 1) // args.multiple_of)
 
         self.w1 = nn.Linear(args.dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, args.dim, bias=False)
@@ -108,13 +118,96 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
+class Gate(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.dim = args.dim
+        self.topk = args.n_activated_experts
+        self.n_routed_experts = args.n_routed_experts
+        self.weight = nn.Parameter(torch.empty(self.n_routed_experts, self.dim))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def forward(self, x):
+        # x: (N, dim)
+        scores = F.linear(x, self.weight) # (N, n_experts)
+        scores = scores.softmax(dim=-1)
+        
+        topk_scores, topk_indices = scores.topk(self.topk, dim=-1)
+        
+        # Normalize scores
+        topk_scores = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-6)
+        
+        return topk_scores, topk_indices
+
+class MoE(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.dim = args.dim
+        self.n_routed_experts = args.n_routed_experts
+        self.n_activated_experts = args.n_activated_experts
+        self.n_shared_experts = args.n_shared_experts
+        
+        self.gate = Gate(args)
+        
+        # Routed Experts
+        self.experts = nn.ModuleList([
+            FeedForward(args, hidden_dim_override=args.moe_inter_dim) 
+            for _ in range(self.n_routed_experts)
+        ])
+        
+        # Shared Experts
+        if self.n_shared_experts > 0:
+             # Shared experts usually have larger capacity or same as routed?
+             # DeepSeek uses MLP(dim, n_shared * inter_dim)
+             self.shared_experts = FeedForward(args, hidden_dim_override=args.moe_inter_dim * self.n_shared_experts)
+        
+    def forward(self, x):
+        # x: (bsz, seqlen, dim)
+        bsz, seqlen, dim = x.shape
+        
+        # Flatten for routing
+        x_flat = x.view(-1, dim)
+        
+        # Shared path
+        shared_out = 0
+        if self.n_shared_experts > 0:
+            shared_out = self.shared_experts(x_flat)
+            
+        # Routed path
+        weights, indices = self.gate(x_flat) # (N, topk), (N, topk)
+        
+        y = torch.zeros_like(x_flat)
+        
+        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
+        for i in range(self.n_routed_experts):
+            if counts[i] == 0:
+                continue
+            expert = self.experts[i]
+            idx, top = torch.where(indices == i)
+            
+            if idx.numel() > 0:
+                # x_flat[idx] is (M, dim)
+                expert_out = expert(x_flat[idx])
+                # weights[idx, top] is (M,) -> unsqueeze to (M, 1) for broadcasting if expert_out is (M, dim)
+                w = weights[idx, top].unsqueeze(-1)
+                y[idx] += expert_out * w
+                
+        y = y + shared_out
+        y = y.view(bsz, seqlen, dim)
+        return y
+
 class Block(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.attention = Attention(args)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.feed_forward = FeedForward(args)
+        
+        if args.use_moe:
+            self.feed_forward = MoE(args)
+        else:
+            self.feed_forward = FeedForward(args)
+            
         self.dropout = nn.Dropout(args.dropout)
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
@@ -126,15 +219,35 @@ class Transformer(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
-        # Feature Encoder: input_dim -> 64 -> dim
+        # Feature Encoder: input_dim -> 128 -> 256 -> dim
         self.feature_encoder = nn.Sequential(
-            nn.Linear(args.input_dim, 64),
+            nn.Linear(args.input_dim, 128),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Linear(64, args.dim)
+            nn.Dropout(0.2),
+            nn.Linear(128, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, args.dim)
         )
         self.layers = nn.ModuleList([Block(args) for _ in range(args.n_layers)])
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.output = nn.Linear(args.dim, args.num_classes, bias=False)
+        
+        # Dual Branch Pooling
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        
+        # Enhanced Classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(args.dim * 2, args.dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(args.dim, args.dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(args.dim // 2, args.num_classes)
+        )
 
         # Precompute RoPE frequencies
         self.freqs_cis = self.precompute_freqs_cis(args.dim // args.n_heads, args.max_seq_len * 2)
@@ -148,8 +261,12 @@ class Transformer(nn.Module):
 
     def forward(self, x: torch.Tensor):
         # x: (bsz, seqlen, input_dim)
-        bsz, seqlen, _ = x.shape
-        h = self.feature_encoder(x)
+        bsz, seqlen, feat_dim = x.shape
+        
+        # Reshape for feature encoder which expects (N, input_dim)
+        x_flat = x.reshape(-1, feat_dim)
+        h = self.feature_encoder(x_flat)
+        h = h.reshape(bsz, seqlen, -1)
         
         freqs_cis = self.freqs_cis[:seqlen].to(h.device)
         
@@ -158,10 +275,13 @@ class Transformer(nn.Module):
             
         h = self.norm(h)
         
-        # Sequence-level classification pooling
-        # Use Max pooling to detect if ANY part of the sequence has a Trojan signature
-        # This fits the anomaly detection nature of the task better than Mean pooling
-        h = h.max(dim=1)[0] # (bsz, dim)
+        # Dual Branch Pooling
+        h_transposed = h.transpose(1, 2)  # (bsz, dim, seqlen)
+        h_max = self.max_pool(h_transposed).squeeze(-1)  # (bsz, dim)
+        h_avg = self.avg_pool(h_transposed).squeeze(-1)  # (bsz, dim)
         
-        logits = self.output(h) # (bsz, num_classes)
+        # Concatenate
+        h_combined = torch.cat([h_max, h_avg], dim=1)  # (bsz, dim*2)
+        
+        logits = self.classifier(h_combined)
         return logits

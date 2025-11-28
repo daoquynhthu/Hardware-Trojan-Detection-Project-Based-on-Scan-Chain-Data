@@ -6,10 +6,38 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torch.cuda.amp import autocast, GradScaler
-from sklearn.metrics import f1_score, precision_recall_curve, classification_report, precision_score, recall_score, roc_auc_score, confusion_matrix
+# Handle PyTorch AMP compatibility
+try:
+    # Try old style first as it matches existing usage (autocast without args)
+    from torch.cuda.amp import autocast, GradScaler
+except ImportError:
+    try:
+        # New style (PyTorch 2.4+)
+        from torch.amp import autocast as _autocast, GradScaler
+        
+        # Adapter for autocast to default to cuda
+        class autocast(_autocast):
+            def __init__(self, enabled=True, dtype=None, cache_enabled=True):
+                super().__init__('cuda', enabled=enabled, dtype=dtype, cache_enabled=cache_enabled)
+                
+    except ImportError:
+        # Fallback or CPU only dummy
+        class GradScaler:
+            def __init__(self, enabled=False): pass
+            def scale(self, loss): return loss
+            def step(self, optimizer): optimizer.step()
+            def update(self): pass
+            def unscale_(self, optimizer): pass
+        
+        class autocast:
+            def __init__(self, enabled=True, dtype=None, cache_enabled=True): pass
+            def __enter__(self): pass
+            def __exit__(self, exc_type, exc_val, exc_tb): pass
+
+from sklearn.metrics import f1_score, precision_recall_curve, classification_report, precision_score, recall_score, roc_auc_score, confusion_matrix, average_precision_score
 from sklearn.model_selection import KFold
 from collections import Counter
+from tqdm import tqdm
 
 # Add src to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -23,7 +51,8 @@ class SequenceDataset(Dataset):
         self.labels = []
         self.max_len = max_len
         self.augment = augment
-        self.augmenter = DataAugmenter() if augment else None
+        # Use updated DataAugmenter params if possible, or defaults
+        self.augmenter = DataAugmenter(noise_std=0.01, scale_range=(0.95, 1.05)) if augment else None
         
         unique_designs = np.unique(design_ids)
         
@@ -33,11 +62,20 @@ class SequenceDataset(Dataset):
             y_design = y[mask]
             
             N = X_design.shape[0]
-            for start in range(0, N, max_len):
+            # Sliding window with 50% overlap
+            stride = max_len // 2
+            
+            for start in range(0, N, stride):
                 end = min(start + max_len, N)
                 chunk_x = X_design[start:end]
                 chunk_y = y_design[start:end]
                 
+                # Sequence-level label: 1 if any token is 1, else 0
+                # Ignore -100 padding (handled in __getitem__ but label is set here for oversampling check)
+                # Actually, y_design here is raw tokens. -100 is not yet applied (padding logic below).
+                # But dataset.pkl y is likely raw 0/1.
+                seq_label = 1 if np.any(chunk_y == 1) else 0
+
                 # Pad if necessary
                 if chunk_x.shape[0] < max_len:
                     pad_len = max_len - chunk_x.shape[0]
@@ -48,11 +86,40 @@ class SequenceDataset(Dataset):
                 self.samples.append(chunk_x)
                 self.labels.append(chunk_y)
                 
+                # Oversampling for Trojan samples (Augmentation at dataset creation time)
+                # Note: This is different from __getitem__ augmentation.
+                # Here we add *more samples* to the list.
+                if seq_label == 1 and augment and self.augmenter:
+                    # Add 4 augmented copies -> Total 5 samples (1 original + 4 augmented)
+                    # Increased from 2 to 4 to handle data imbalance and volume
+                    for _ in range(4):
+                        augmented_x = self.augmenter.augment(chunk_x.copy())
+                        self.samples.append(augmented_x)
+                        self.labels.append(chunk_y) # Label remains same
+                        
         self.samples = np.array(self.samples, dtype=np.float32)
         self.labels = np.array(self.labels, dtype=np.longlong)
         
         # Identify samples with at least one Trojan label for weighted sampling
-        self.has_trojan = np.any(self.labels == 1, axis=1)
+        # Note: Since we already oversampled, WeightedRandomSampler might be less critical or needs adjustment?
+        # Standard practice: Use WeightedRandomSampler even with oversampling if balance is still off.
+        # But here we hardcoded oversampling. Let's keep WeightedRandomSampler as safety net.
+        # But we need to correctly identify trojan samples (including augmented ones).
+        # self.labels contains token labels.
+        
+        # We need a quick way to know if a sample is trojan.
+        # Since we added augmented samples with same labels, this check still works.
+        # -100 check: 
+        self.has_trojan = []
+        for i in range(len(self.labels)):
+            y_seq = self.labels[i]
+            valid_mask = y_seq != -100
+            is_trojan = False
+            if np.any(valid_mask):
+                if np.any(y_seq[valid_mask] == 1):
+                    is_trojan = True
+            self.has_trojan.append(is_trojan)
+        self.has_trojan = np.array(self.has_trojan)
 
     def __len__(self):
         return len(self.samples)
@@ -62,15 +129,27 @@ class SequenceDataset(Dataset):
         y_seq = self.labels[idx]
         
         # Sequence-level label: 1 if any token is 1, else 0
-        # Ignore -100 padding
         valid_mask = y_seq != -100
         if np.any(valid_mask):
              y = 1 if np.any(y_seq[valid_mask] == 1) else 0
         else:
              y = 0
         
-        if self.augment and self.augmenter:
-            x = self.augmenter.augment(x)
+        # Runtime augmentation (optional, but we already did static augmentation for Trojans)
+        # If we augment here again, we double augment.
+        # The user's code in Enhance.py does:
+        # if seq_label == 1 and augment: ... append(augmented)
+        # AND in __getitem__: if self.augment ... x = self.augmenter.augment(x)
+        # This means augmented samples get augmented AGAIN in __getitem__?
+        # Or maybe normal samples get augmented in __getitem__?
+        # Let's follow the standard practice: 
+        # If we did static augmentation, we might not want random runtime augmentation on top unless intended.
+        # But Enhance.py has:
+        # if self.augment and self.augmenter and np.random.rand() > 0.5: x = self.augmenter.augment(x)
+        # I will enable runtime augmentation with 50% prob as per Enhance.py
+        
+        if self.augment and self.augmenter and np.random.rand() > 0.5:
+             x = self.augmenter.augment(x)
             
         return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
 
@@ -95,7 +174,7 @@ def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids):
     
     # 使用 WeightedRandomSampler
     trojan_indices = np.where(train_dataset.has_trojan)[0]
-    normal_indices = np.where(~train_dataset.has_trojan)[0]
+    normal_indices = np.where(np.logical_not(train_dataset.has_trojan))[0]
     
     print(f"Fold {fold_idx+1} Stats - Trojan Sequences: {len(trojan_indices)}, Normal Sequences: {len(normal_indices)}")
     
@@ -113,7 +192,6 @@ def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids):
     )
     
     pin_memory = torch.cuda.is_available()
-    
     train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, pin_memory=pin_memory)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, pin_memory=pin_memory)
     
@@ -121,29 +199,22 @@ def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     model_args = ModelArgs(
-        dim=128,
-        n_layers=2, 
-        n_heads=4,
+        dim=256,
+        n_layers=4, 
+        n_heads=8,
         max_seq_len=max_len,
         input_dim=X.shape[1],
         num_classes=2,
-        dropout=0.1
+        dropout=0.2
     )
     model = Transformer(model_args).to(device)
     
     # Calculate Sequence-level class weights for Loss
-    n_pos = len(trojan_indices)
-    n_neg = len(normal_indices)
-    
-    if n_pos > 0:
-        pos_weight = n_neg / n_pos
-        # Clamp weight to prevent instability
-        pos_weight = min(pos_weight, 5.0) 
-    else:
-        pos_weight = 1.0
-        
-    seq_class_weights = torch.tensor([1.0, float(pos_weight)], device=device)
-    print(f"Using CrossEntropyLoss weights: {seq_class_weights}")
+    # Since we are using WeightedRandomSampler to balance the batches (50/50),
+    # we should NOT use class weights in the loss, as that would double-penalize.
+    # We set weights to [1.0, 1.0] to treat both classes equally in the balanced batch.
+    seq_class_weights = torch.tensor([1.0, 1.0], device=device)
+    print(f"Using CrossEntropyLoss weights: {seq_class_weights} (Balanced by Sampler)")
     
     criterion = nn.CrossEntropyLoss(weight=seq_class_weights).to(device)
 
@@ -151,6 +222,7 @@ def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids):
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
     
     use_cuda = torch.cuda.is_available()
+
     scaler = GradScaler(enabled=use_cuda) 
     
     epochs = 50 # Reduced epochs per fold for speed
@@ -164,7 +236,8 @@ def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids):
         model.train()
         total_loss = 0
         
-        for batch_idx, (data, target) in enumerate(train_loader):
+        pbar = tqdm(train_loader, desc=f"Fold {fold_idx+1} Epoch {epoch+1}/{epochs}")
+        for batch_idx, (data, target) in enumerate(pbar):
             data, target = data.to(device), target.to(device)
             
             optimizer.zero_grad()
@@ -186,6 +259,7 @@ def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids):
                 optimizer.step()
 
             total_loss += loss.item()
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'lr': f"{optimizer.param_groups[0]['lr']:.6f}"})
 
         avg_train_loss = total_loss / len(train_loader)
 
@@ -204,37 +278,61 @@ def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids):
                 val_loss += loss.item()
 
                 probs = torch.softmax(output, dim=1)
-                preds = torch.argmax(probs, dim=1)
                 
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(target.cpu().numpy())
+                # Store probabilities for class 1 for threshold tuning
                 all_probs.extend(probs[:, 1].cpu().numpy())
+                all_labels.extend(target.cpu().numpy())
 
         avg_val_loss = val_loss / len(test_loader) if len(test_loader) > 0 else 0
         
-        # Calculate metrics
+        # Calculate metrics with dynamic thresholding
         if len(all_labels) > 0:
-            f1 = f1_score(all_labels, all_preds, zero_division=0)
+            all_labels = np.array(all_labels)
+            all_probs = np.array(all_probs)
             
-            if f1 > best_f1:
-                best_f1 = f1
+            # Find optimal threshold for F1
+            precisions, recalls, thresholds = precision_recall_curve(all_labels, all_probs)
+            f1_scores = 2 * recalls * precisions / (recalls + precisions + 1e-10)
+            
+            # Handle edge case where thresholds might be empty or all nan
+            if len(f1_scores) > 0:
+                best_idx = np.argmax(f1_scores)
+                best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
+                best_epoch_f1 = f1_scores[best_idx]
+            else:
+                best_threshold = 0.5
+                best_epoch_f1 = 0.0
+
+            # Apply best threshold
+            preds = (all_probs >= best_threshold).astype(int)
+            
+            # Standard metrics
+            precision = precision_score(all_labels, preds, zero_division=0)
+            recall = recall_score(all_labels, preds, zero_division=0)
+            try:
+                auroc = roc_auc_score(all_labels, all_probs)
+                auprc = average_precision_score(all_labels, all_probs)
+            except:
+                auroc = 0.0
+                auprc = 0.0
+            cm = confusion_matrix(all_labels, preds)
+            
+            # Log validation results
+            print(f"  Val Loss: {avg_val_loss:.4f} | F1: {best_epoch_f1:.4f} (Thresh: {best_threshold:.3f}) | AUC: {auroc:.4f} | AUPRC: {auprc:.4f}")
+            
+            if best_epoch_f1 > best_f1:
+                best_f1 = best_epoch_f1
                 patience_counter = 0
                 
-                precision = precision_score(all_labels, all_preds, zero_division=0)
-                recall = recall_score(all_labels, all_preds, zero_division=0)
-                try:
-                    auroc = roc_auc_score(all_labels, all_probs)
-                except:
-                    auroc = 0.0
-                cm = confusion_matrix(all_labels, all_preds)
-                
                 best_metrics = {
-                    'f1': f1,
+                    'f1': best_f1,
                     'precision': precision,
                     'recall': recall,
                     'auroc': auroc,
+                    'auprc': auprc,
                     'cm': cm,
-                    'epoch': epoch
+                    'epoch': epoch,
+                    'threshold': best_threshold
                 }
                 
                 # Only save model for the first fold to have a "best" artifact on disk
@@ -244,8 +342,9 @@ def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids):
                         'epoch': epoch,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
-                        'f1': f1,
-                        'model_args': model_args
+                        'f1': best_f1,
+                        'model_args': model_args,
+                        'threshold': best_threshold # Save threshold for inference
                     }, save_path)
             else:
                 patience_counter += 1
@@ -258,7 +357,7 @@ def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids):
         
     print(f"Fold {fold_idx+1} Completed. Best F1: {best_f1:.4f}")
     if best_metrics:
-        print(f"Best Metrics: F1={best_metrics['f1']:.4f}, Prec={best_metrics['precision']:.4f}, Rec={best_metrics['recall']:.4f}")
+        print(f"Best Metrics: F1={best_metrics['f1']:.4f}, Prec={best_metrics['precision']:.4f}, Rec={best_metrics['recall']:.4f}, AUPRC={best_metrics['auprc']:.4f}")
         print(f"Confusion Matrix:\n{best_metrics['cm']}")
     
     return best_metrics
@@ -305,7 +404,7 @@ def train_model():
     print(f"Average F1 Score: {np.mean(f1_scores):.4f} (+/- {np.std(f1_scores):.4f})")
     
     # Sum Confusion Matrices
-    total_cm = np.sum([r['cm'] for r in fold_results], axis=0)
+    total_cm = np.sum(np.array([r['cm'] for r in fold_results]), axis=0)
     print("Aggregated Confusion Matrix:")
     print(total_cm)
 

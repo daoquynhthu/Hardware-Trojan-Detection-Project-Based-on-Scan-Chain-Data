@@ -25,26 +25,41 @@ def load_transformer_model(device):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Transformer model not found at {model_path}")
         
-    # Assuming default args for now. Ideally, load these from a config file saved with the model.
-    model_args = ModelArgs(
-        dim=128,
-        n_layers=2,
-        n_heads=4,
-        max_seq_len=1024,
-        input_dim=35, # Default based on current dataset
-        num_classes=2,
-        dropout=0.0 # No dropout for inference
-    )
+    checkpoint = torch.load(model_path, map_location=device)
+    
+    # Try to load args from checkpoint
+    if isinstance(checkpoint, dict) and 'model_args' in checkpoint:
+        print("Loading ModelArgs from checkpoint...")
+        model_args = checkpoint['model_args']
+        # Ensure dropout is 0 for inference
+        if hasattr(model_args, 'dropout'):
+             model_args.dropout = 0.0
+    else:
+        print("ModelArgs not found in checkpoint. Using defaults.")
+        # Assuming default args for now.
+        model_args = ModelArgs(
+            dim=128,
+            n_layers=2,
+            n_heads=4,
+            max_seq_len=1024,
+            input_dim=35, # Default based on current dataset
+            num_classes=2,
+            dropout=0.0 # No dropout for inference
+        )
     
     model = Transformer(model_args).to(device)
     
     # Load state dict
+    state_dict = checkpoint
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    
     try:
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.load_state_dict(state_dict)
     except Exception as e:
         print(f"Error loading model state dict: {e}")
         print("Attempting strict=False...")
-        model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
+        model.load_state_dict(state_dict, strict=False)
         
     model.eval()
     return model
@@ -105,12 +120,18 @@ def main():
         print("Error: Unsupported file format. Use .pkl or .npy")
         return
 
+    # Explicitly cast to numpy array to resolve linter errors and ensure correct type
+    X = np.array(X)
+
     # Ensure X is 2D
     if len(X.shape) != 2:
         print(f"Error: Expected 2D input (N, features), got {X.shape}")
         return
         
     print(f"Data shape: {X.shape}")
+    
+    # Initialize preds to avoid unbound variable error
+    preds = None
     
     if args.model == "lgbm":
         print("Loading LightGBM model...")
@@ -135,9 +156,14 @@ def main():
             return
         
     # Save results
-    print(f"Saving results to {args.output}...")
-    np.save(args.output, preds)
-    print("Done.")
+    if preds is not None:
+        print(f"Saving results to {args.output}...")
+        # Explicitly cast to numpy array to satisfy linter and ensure compatibility
+        preds_array = np.array(preds)
+        np.save(args.output, preds_array)
+        print("Done.")
+    else:
+        print("Error: Inference failed or model type not recognized.")
 
 if __name__ == "__main__":
     main()
