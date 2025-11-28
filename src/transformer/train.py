@@ -7,7 +7,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.cuda.amp import autocast, GradScaler
-from sklearn.metrics import f1_score, precision_recall_curve, classification_report, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import f1_score, precision_recall_curve, classification_report, precision_score, recall_score, roc_auc_score, confusion_matrix
+from sklearn.model_selection import KFold
 from collections import Counter
 
 # Add src to path
@@ -73,38 +74,10 @@ class SequenceDataset(Dataset):
             
         return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
 
-def train_model():
-    # Create output directory
-    os.makedirs(TRANSFORMER_MODEL_DIR, exist_ok=True)
-    
-    dataset_path = os.path.join(DATA_DIR, "dataset.pkl")
-    if not os.path.exists(dataset_path):
-        print(f"Error: Dataset not found at {dataset_path}")
-        return
-
-    print("Loading dataset...")
-    with open(dataset_path, "rb") as f:
-        data = pickle.load(f)
-        
-    X = data["X"]
-    y = data["y"]
-    design_ids = data["design_ids"]
-    
-    # 分析类别分布
-    unique, counts = np.unique(y, return_counts=True)
-    print(f"Original Token Label distribution: {dict(zip(unique, counts))}")
-    
-    # Split designs
-    unique_designs = np.unique(design_ids)
-    np.random.seed(42)
-    np.random.shuffle(unique_designs)
-    
-    test_size = max(1, int(len(unique_designs) * 0.2))
-    test_designs = unique_designs[:test_size]
-    train_designs = unique_designs[test_size:]
-    
-    print(f"Train designs: {train_designs}")
-    print(f"Test designs: {test_designs}")
+def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids):
+    print(f"\n=== Starting Fold {fold_idx+1} ===")
+    print(f"Train Designs: {train_designs}")
+    print(f"Test Designs: {test_designs}")
     
     mask_test = np.isin(design_ids, test_designs)
     mask_train = ~mask_test
@@ -124,7 +97,7 @@ def train_model():
     trojan_indices = np.where(train_dataset.has_trojan)[0]
     normal_indices = np.where(~train_dataset.has_trojan)[0]
     
-    print(f"Sequence Stats - Trojan: {len(trojan_indices)}, Normal: {len(normal_indices)}")
+    print(f"Fold {fold_idx+1} Stats - Trojan Sequences: {len(trojan_indices)}, Normal Sequences: {len(normal_indices)}")
     
     weights = np.zeros(len(train_dataset))
     if len(trojan_indices) > 0:
@@ -146,10 +119,6 @@ def train_model():
     
     # Setup Model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    if device.type == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        torch.backends.cudnn.benchmark = True
     
     model_args = ModelArgs(
         dim=128,
@@ -168,9 +137,7 @@ def train_model():
     
     if n_pos > 0:
         pos_weight = n_neg / n_pos
-        print(f"Seq stats: Neg={n_neg}, Pos={n_pos}, Calculated Pos Weight={pos_weight:.2f}")
-        # 既然已经用了 Sampler，Loss 里的权重可以给小一点，或者干脆不用
-        # 但为了保险，还是给一点权重，特别是如果 Sampler 有时候采不到足够的样本
+        # Clamp weight to prevent instability
         pos_weight = min(pos_weight, 5.0) 
     else:
         pos_weight = 1.0
@@ -186,15 +153,12 @@ def train_model():
     use_cuda = torch.cuda.is_available()
     scaler = GradScaler(enabled=use_cuda) 
     
-    epochs = 100
+    epochs = 50 # Reduced epochs per fold for speed
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     best_f1 = 0.0
-    patience = 20
+    best_metrics = {}
+    patience = 15
     patience_counter = 0
-    
-    # Initialize metric containers
-    all_preds = []
-    all_labels = []
     
     for epoch in range(epochs):
         model.train()
@@ -251,48 +215,99 @@ def train_model():
         # Calculate metrics
         if len(all_labels) > 0:
             f1 = f1_score(all_labels, all_preds, zero_division=0)
-            precision = precision_score(all_labels, all_preds, zero_division=0)
-            recall = recall_score(all_labels, all_preds, zero_division=0)
             
-            if len(np.unique(all_labels)) > 1:
-                auroc = roc_auc_score(all_labels, all_probs)
-            else:
-                auroc = 0.0
-                
-            pred_dist = Counter(all_preds)
-            print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
-            print(f"  F1: {f1:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, AUROC: {auroc:.4f}")
-            print(f"  Predictions - Normal: {pred_dist.get(0, 0)}, Trojan: {pred_dist.get(1, 0)}")
-
-            scheduler.step()
-                    
-            # Save best model
             if f1 > best_f1:
                 best_f1 = f1
                 patience_counter = 0
-                save_path = os.path.join(TRANSFORMER_MODEL_DIR, "best_model.pth")
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
+                
+                precision = precision_score(all_labels, all_preds, zero_division=0)
+                recall = recall_score(all_labels, all_preds, zero_division=0)
+                try:
+                    auroc = roc_auc_score(all_labels, all_probs)
+                except:
+                    auroc = 0.0
+                cm = confusion_matrix(all_labels, all_preds)
+                
+                best_metrics = {
                     'f1': f1,
-                    'model_args': model_args
-                }, save_path)
-                print(f"  ✓ Saved new best model with F1: {f1:.4f}")
+                    'precision': precision,
+                    'recall': recall,
+                    'auroc': auroc,
+                    'cm': cm,
+                    'epoch': epoch
+                }
+                
+                # Only save model for the first fold to have a "best" artifact on disk
+                if fold_idx == 0:
+                    save_path = os.path.join(TRANSFORMER_MODEL_DIR, "best_model.pth")
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'f1': f1,
+                        'model_args': model_args
+                    }, save_path)
             else:
                 patience_counter += 1
-                if patience_counter >= patience:
-                    print(f"Early stopping triggered after {patience} epochs without improvement")
-                    break
-        else:
-            print(f"Epoch {epoch+1}/{epochs}: No validation data found.")
+                
+            scheduler.step()
+            
+            if patience_counter >= patience:
+                print(f"  Fold {fold_idx+1}: Early stopping at epoch {epoch+1}")
+                break
+        
+    print(f"Fold {fold_idx+1} Completed. Best F1: {best_f1:.4f}")
+    if best_metrics:
+        print(f"Best Metrics: F1={best_metrics['f1']:.4f}, Prec={best_metrics['precision']:.4f}, Rec={best_metrics['recall']:.4f}")
+        print(f"Confusion Matrix:\n{best_metrics['cm']}")
+    
+    return best_metrics
 
-    # Final evaluation
+def train_model():
+    # Create output directory
+    os.makedirs(TRANSFORMER_MODEL_DIR, exist_ok=True)
+    
+    dataset_path = os.path.join(DATA_DIR, "dataset.pkl")
+    if not os.path.exists(dataset_path):
+        print(f"Error: Dataset not found at {dataset_path}")
+        return
+
+    print("Loading dataset...")
+    with open(dataset_path, "rb") as f:
+        data = pickle.load(f)
+        
+    X = data["X"]
+    y = data["y"]
+    design_ids = data["design_ids"]
+    
+    unique_designs = np.unique(design_ids)
+    print(f"Total Designs: {len(unique_designs)}")
+    
+    # 3-Fold Cross Validation
+    kf = KFold(n_splits=3, shuffle=True, random_state=42)
+    
+    fold_results = []
+    
+    for fold_idx, (train_idx, test_idx) in enumerate(kf.split(unique_designs)):
+        train_designs = unique_designs[train_idx]
+        test_designs = unique_designs[test_idx]
+        
+        metrics = train_fold(fold_idx, train_designs, test_designs, X, y, design_ids)
+        if metrics:
+            fold_results.append(metrics)
+            
+    # Aggregate Results
     print("\n" + "="*50)
-    print("Training completed!")
-    print(f"Best F1 Score: {best_f1:.4f}")
-    if len(all_labels) > 0:
-        print(classification_report(all_labels, all_preds, target_names=['Normal', 'Trojan'], zero_division=0))
+    print("Cross-Validation Completed!")
+    
+    f1_scores = [r['f1'] for r in fold_results]
+    print(f"F1 Scores per Fold: {[f'{s:.4f}' for s in f1_scores]}")
+    print(f"Average F1 Score: {np.mean(f1_scores):.4f} (+/- {np.std(f1_scores):.4f})")
+    
+    # Sum Confusion Matrices
+    total_cm = np.sum([r['cm'] for r in fold_results], axis=0)
+    print("Aggregated Confusion Matrix:")
+    print(total_cm)
 
 if __name__ == "__main__":
     train_model()
