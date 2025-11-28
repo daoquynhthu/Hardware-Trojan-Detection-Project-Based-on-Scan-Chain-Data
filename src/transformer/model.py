@@ -90,6 +90,11 @@ def reshape_for_broadcast(freqs_cis, x):
     """
     ndim = x.ndim
     # 🔧 修复: shape[2]是seqlen, shape[-1]是head_dim//2
+    # Slice freqs_cis to match current sequence length
+    seq_len = x.shape[2]
+    if freqs_cis.shape[0] > seq_len:
+        freqs_cis = freqs_cis[:seq_len]
+
     assert freqs_cis.shape == (x.shape[2], x.shape[-1]), \
         f"freqs_cis shape {freqs_cis.shape} doesn't match x shape {x.shape[2:]}"
     
@@ -407,12 +412,13 @@ class Transformer(nn.Module):
         🔧 B2修复: 正确处理tensor类型
         获取所有MoE层的auxiliary loss
         """
-        aux_loss = 0.0
+        # Initialize as tensor on the correct device
+        device = next(self.parameters()).device
+        aux_loss = torch.tensor(0.0, device=device)
+        
         for layer in self.layers:
-            if hasattr(layer.ffn, 'aux_loss') and layer.ffn.aux_loss is not None:
-                # 🔧 修复: 处理tensor类型
-                if isinstance(layer.ffn.aux_loss, torch.Tensor):
-                    aux_loss += layer.ffn.aux_loss.item()
-                else:
-                    aux_loss += layer.ffn.aux_loss
+            # Use getattr to avoid linter errors about unknown attributes
+            layer_aux = getattr(layer.ffn, 'aux_loss', None)
+            if layer_aux is not None:
+                aux_loss = aux_loss + layer_aux
         return aux_loss

@@ -1,38 +1,64 @@
 import os
 import sys
 import pickle
+import json
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 # Handle PyTorch AMP compatibility
+# Define dummy classes first with unique names to avoid linter confusion
+class _CpuGradScaler:
+    def __init__(self, enabled=False): pass
+    def scale(self, loss): return loss
+    def step(self, optimizer): optimizer.step()
+    def update(self): pass
+    def unscale_(self, optimizer): pass
+
+class _CpuAutocast:
+    def __init__(self, enabled=True, dtype=None, cache_enabled=True): pass
+    def __enter__(self): pass
+    def __exit__(self, exc_type, exc_val, exc_tb): pass
+
+# Initialize with CPU fallbacks
+GradScaler = _CpuGradScaler
+autocast = _CpuAutocast
+
 try:
-    # Try old style first as it matches existing usage (autocast without args)
-    from torch.cuda.amp import autocast, GradScaler
+    # Try new API first (PyTorch 2.4+)
+    # Linter suggests importing from submodules directly
+    from torch.amp.grad_scaler import GradScaler as _AmpGradScaler
+    from torch.amp.autocast_mode import autocast as _AmpAutocast
+    
+    class _WrapperGradScaler(_AmpGradScaler):
+        def __init__(self, init_scale=65536.0, growth_factor=2.0, backoff_factor=0.5, growth_interval=2000, enabled=True):
+            # Default to 'cuda' device for compatibility
+            super().__init__('cuda', init_scale, growth_factor, backoff_factor, growth_interval, enabled)
+            
+    class _WrapperAutocast(_AmpAutocast):
+        def __init__(self, enabled=True, dtype=None, cache_enabled=True):
+            super().__init__(device_type='cuda', dtype=dtype, enabled=enabled, cache_enabled=cache_enabled)
+
+    GradScaler = _WrapperGradScaler
+    autocast = _WrapperAutocast
+    
 except ImportError:
     try:
-        # New style (PyTorch 2.4+)
-        from torch.amp import autocast as _autocast, GradScaler
-        
-        # Adapter for autocast to default to cuda
-        class autocast(_autocast):
-            def __init__(self, enabled=True, dtype=None, cache_enabled=True):
-                super().__init__('cuda', enabled=enabled, dtype=dtype, cache_enabled=cache_enabled)
-                
+        # Fallback to legacy CUDA AMP
+        from torch.cuda.amp import GradScaler as _CudaGradScaler, autocast as _CudaAutocast
+        GradScaler = _CudaGradScaler
+        autocast = _CudaAutocast
     except ImportError:
-        # Fallback or CPU only dummy
-        class GradScaler:
-            def __init__(self, enabled=False): pass
-            def scale(self, loss): return loss
-            def step(self, optimizer): optimizer.step()
-            def update(self): pass
-            def unscale_(self, optimizer): pass
-        
-        class autocast:
-            def __init__(self, enabled=True, dtype=None, cache_enabled=True): pass
-            def __enter__(self): pass
-            def __exit__(self, exc_type, exc_val, exc_tb): pass
+        # Keep CPU fallbacks
+        pass
+
+# Ensure we use the dummies if CUDA is not available at runtime, 
+# although torch.cuda.amp might exist but fail or be slow.
+# Actually, PyTorch's GradScaler(enabled=False) is fine on CPU.
+# So we only need this fallback if the import FAILS (old PyTorch).
+# If the import succeeds, we use the real classes.
+
 
 from sklearn.metrics import f1_score, precision_recall_curve, classification_report, precision_score, recall_score, roc_auc_score, confusion_matrix, average_precision_score
 from sklearn.model_selection import KFold
@@ -46,13 +72,17 @@ from src.transformer.model import Transformer, ModelArgs
 from src.transformer.augmentation import DataAugmenter
 
 class SequenceDataset(Dataset):
-    def __init__(self, X, y, design_ids, max_len=1024, augment=False):
+    def __init__(self, X, y, design_ids, config, augment=False):
         self.samples = []
         self.labels = []
-        self.max_len = max_len
+        self.max_len = config['training']['max_len']
         self.augment = augment
         # Use updated DataAugmenter params if possible, or defaults
-        self.augmenter = DataAugmenter(noise_std=0.01, scale_range=(0.95, 1.05)) if augment else None
+        aug_config = config.get('augmentation', {})
+        self.augmenter = DataAugmenter(
+            noise_std=aug_config.get('noise_std', 0.01), 
+            scale_range=(aug_config.get('scale_range_min', 0.95), aug_config.get('scale_range_max', 1.05))
+        ) if augment else None
         
         unique_designs = np.unique(design_ids)
         
@@ -63,10 +93,10 @@ class SequenceDataset(Dataset):
             
             N = X_design.shape[0]
             # Sliding window with 50% overlap
-            stride = max_len // 2
+            stride = self.max_len // 2
             
             for start in range(0, N, stride):
-                end = min(start + max_len, N)
+                end = min(start + self.max_len, N)
                 chunk_x = X_design[start:end]
                 chunk_y = y_design[start:end]
                 
@@ -77,8 +107,8 @@ class SequenceDataset(Dataset):
                 seq_label = 1 if np.any(chunk_y == 1) else 0
 
                 # Pad if necessary
-                if chunk_x.shape[0] < max_len:
-                    pad_len = max_len - chunk_x.shape[0]
+                if chunk_x.shape[0] < self.max_len:
+                    pad_len = self.max_len - chunk_x.shape[0]
                     feat_dim = chunk_x.shape[1]
                     chunk_x = np.vstack([chunk_x, np.zeros((pad_len, feat_dim))])
                     chunk_y = np.concatenate([chunk_y, -100 * np.ones(pad_len)])
@@ -153,7 +183,15 @@ class SequenceDataset(Dataset):
             
         return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
 
-def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids):
+def get_sampler(dataset):
+    class_counts = Counter(dataset.has_trojan)
+    if 1 not in class_counts:  # 新增
+        class_counts[1] = 1  # dummy
+    weights = [1.0 / class_counts[label] for label in dataset.has_trojan]
+    sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
+    return sampler
+
+def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids, config):
     print(f"\n=== Starting Fold {fold_idx+1} ===")
     print(f"Train Designs: {train_designs}")
     print(f"Test Designs: {test_designs}")
@@ -165,12 +203,11 @@ def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids):
     X_test, y_test, id_test = X[mask_test], y[mask_test], design_ids[mask_test]
     
     # Create Datasets
-    max_len = 512
-    batch_size = 16
+    batch_size = config['training']['batch_size']
     
     # 启用数据增强
-    train_dataset = SequenceDataset(X_train, y_train, id_train, max_len=max_len, augment=True)
-    test_dataset = SequenceDataset(X_test, y_test, id_test, max_len=max_len, augment=False)
+    train_dataset = SequenceDataset(X_train, y_train, id_train, config=config, augment=True)
+    test_dataset = SequenceDataset(X_test, y_test, id_test, config=config, augment=False)
     
     # 使用 WeightedRandomSampler
     trojan_indices = np.where(train_dataset.has_trojan)[0]
@@ -178,58 +215,59 @@ def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids):
     
     print(f"Fold {fold_idx+1} Stats - Trojan Sequences: {len(trojan_indices)}, Normal Sequences: {len(normal_indices)}")
     
-    weights = np.zeros(len(train_dataset))
-    if len(trojan_indices) > 0:
-        weights[trojan_indices] = 0.5 / len(trojan_indices)
-        weights[normal_indices] = 0.5 / len(normal_indices)
-    else:
-        weights[:] = 1.0 / len(train_dataset)
-        
-    sampler = WeightedRandomSampler(
-        weights=weights.tolist(),
-        num_samples=len(weights),
-        replacement=True
-    )
+    sampler = get_sampler(train_dataset)
     
     pin_memory = torch.cuda.is_available()
     train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, pin_memory=pin_memory)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, pin_memory=pin_memory)
     
     # Setup Model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
     
+    model_cfg = config['model']
     model_args = ModelArgs(
-        dim=256,
-        n_layers=4, 
-        n_heads=8,
-        max_seq_len=max_len,
+        dim=model_cfg['dim'],
+        n_layers=model_cfg['n_layers'], 
+        n_heads=model_cfg['n_heads'],
+        max_seq_len=config['training']['max_len'],
         input_dim=X.shape[1],
         num_classes=2,
-        dropout=0.2
+        dropout=model_cfg['dropout'],
+        use_moe=model_cfg.get('use_moe', True),
+        n_routed_experts=model_cfg.get('n_routed_experts', 8),
+        n_activated_experts=model_cfg.get('n_activated_experts', 2),
+        n_shared_experts=model_cfg.get('n_shared_experts', 1),
+        moe_inter_dim=model_cfg.get('moe_inter_dim', 256),
+        moe_balance_coef=model_cfg.get('moe_balance_coef', 0.01),
+        gate_temperature=model_cfg.get('gate_temperature', 0.5)
     )
     model = Transformer(model_args).to(device)
     
     # Calculate Sequence-level class weights for Loss
-    # Since we are using WeightedRandomSampler to balance the batches (50/50),
-    # we should NOT use class weights in the loss, as that would double-penalize.
-    # We set weights to [1.0, 1.0] to treat both classes equally in the balanced batch.
-    seq_class_weights = torch.tensor([1.0, 1.0], device=device)
-    print(f"Using CrossEntropyLoss weights: {seq_class_weights} (Balanced by Sampler)")
+    pos_weight_val = config['training'].get('pos_weight', [1.0, 5.0])
+    pos_weight = torch.tensor(pos_weight_val, device=device)
+    print(f"Using CrossEntropyLoss weights: {pos_weight}")
     
-    criterion = nn.CrossEntropyLoss(weight=seq_class_weights).to(device)
+    criterion = nn.CrossEntropyLoss(weight=pos_weight).to(device)
 
     # optimizer
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    optimizer = optim.AdamW(model.parameters(), lr=config['training']['lr'], weight_decay=config['training']['weight_decay'])
     
     use_cuda = torch.cuda.is_available()
 
     scaler = GradScaler(enabled=use_cuda) 
     
-    epochs = 50 # Reduced epochs per fold for speed
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    epochs = config['training']['epochs']
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='max', 
+        factor=config['training'].get('scheduler_factor', 0.5), 
+        patience=config['training'].get('scheduler_patience', 3)
+    )
     best_f1 = 0.0
     best_metrics = {}
-    patience = 15
+    patience = config['training']['patience']
     patience_counter = 0
     
     for epoch in range(epochs):
@@ -244,22 +282,27 @@ def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids):
             
             if use_cuda:
                 with autocast():
-                    output = model(data) # (bsz, 2)
-                    loss = criterion(output, target)
+                    logits = model(data) # (bsz, 2)
+                    ce_loss = criterion(logits, target)
+                    aux = model.get_aux_loss() * model_args.moe_balance_coef if model_args.use_moe else 0.0
+                    loss = ce_loss + aux
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                output = model(data)
-                loss = criterion(output, target)
+                logits = model(data)
+                ce_loss = criterion(logits, target)
+                aux = model.get_aux_loss() * model_args.moe_balance_coef if model_args.use_moe else 0.0
+                loss = ce_loss + aux
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
             total_loss += loss.item()
-            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'lr': f"{optimizer.param_groups[0]['lr']:.6f}"})
+            aux_val = aux.item() if isinstance(aux, torch.Tensor) else aux
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'aux': f"{aux_val:.4f}", 'lr': f"{optimizer.param_groups[0]['lr']:.6f}"})
 
         avg_train_loss = total_loss / len(train_loader)
 
@@ -349,7 +392,7 @@ def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids):
             else:
                 patience_counter += 1
                 
-            scheduler.step()
+            scheduler.step(best_epoch_f1)
             
             if patience_counter >= patience:
                 print(f"  Fold {fold_idx+1}: Early stopping at epoch {epoch+1}")
@@ -385,13 +428,34 @@ def train_model():
     # 3-Fold Cross Validation
     kf = KFold(n_splits=3, shuffle=True, random_state=42)
     
+    # Load config
+    config_path = os.path.join(os.path.dirname(__file__), 'train_config.json')
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        print(f"Loaded config from {config_path}")
+    else:
+        print(f"Config not found at {config_path}, using default hardcoded values (fallback)")
+        # Fallback config if file missing (safety)
+        config = {
+            "training": {
+                "batch_size": 16, "epochs": 50, "lr": 1e-4, "weight_decay": 0.01,
+                "patience": 15, "max_len": 512, "pos_weight": [1.0, 5.0]
+            },
+            "model": {
+                "dim": 256, "n_layers": 4, "n_heads": 8, "dropout": 0.2,
+                "use_moe": True
+            },
+            "augmentation": {}
+        }
+
     fold_results = []
     
     for fold_idx, (train_idx, test_idx) in enumerate(kf.split(unique_designs)):
         train_designs = unique_designs[train_idx]
         test_designs = unique_designs[test_idx]
         
-        metrics = train_fold(fold_idx, train_designs, test_designs, X, y, design_ids)
+        metrics = train_fold(fold_idx, train_designs, test_designs, X, y, design_ids, config)
         if metrics:
             fold_results.append(metrics)
             
