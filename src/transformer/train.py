@@ -134,8 +134,10 @@ class SequenceDataset(Dataset):
                     # This turns 1 sequence into ~30 sequences
                     step = 16 
                 elif has_trojan and not self.augment:
-                    # Test mode + Trojan: Regular stride to ensure we catch it, but don't over-evaluate
-                    step = self.max_len // 2 
+                    # Test mode + Trojan: Dense stride to smooth out F1 metrics
+                    # Previous: max_len // 2 (250) -> yielded very few samples, causing grainy metrics
+                    # New: 50 -> Increases validation positive samples by ~5x
+                    step = 50 
                 else:
                     # Clean sequence: Standard stride
                     step = self.max_len // 2
@@ -248,6 +250,11 @@ def train_fold(fold_idx, train_designs, test_designs, X, y, design_ids, config):
     # 启用数据增强
     train_dataset = SequenceDataset(X_train, y_train, id_train, config=config, augment=True)
     test_dataset = SequenceDataset(X_test, y_test, id_test, config=config, augment=False)
+    
+    # Add stats for Test Dataset
+    test_trojan = np.sum(test_dataset.has_trojan)
+    test_normal = len(test_dataset) - test_trojan
+    print(f"Test Set Stats  - Trojan Sequences: {test_trojan}, Normal Sequences: {test_normal}")
     
     # 使用 WeightedRandomSampler
     trojan_indices = np.where(train_dataset.has_trojan)[0]

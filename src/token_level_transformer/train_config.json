@@ -1,0 +1,36 @@
+{
+    "training": {
+        "batch_size": 32,
+        "epochs": 30,
+        "lr": 5e-4,
+        "weight_decay": 0.01,
+        "patience": 10,
+        "scheduler_factor": 0.5,
+        "scheduler_patience": 5,
+        "max_len": 512,
+        "pos_weight": [1.0, 5.0],
+        "label_smoothing": 0.0,
+        "use_focal_loss": false,
+        "focal_gamma": 2.0,
+        "focal_alpha": 0.75
+    },
+    "model": {
+        "dim": 64,
+        "n_layers": 2,
+        "n_heads": 4,
+        "dropout": 0.3,
+        "use_moe": true,
+        "n_routed_experts": 4,
+        "n_activated_experts": 2,
+        "n_shared_experts": 1,
+        "moe_inter_dim": 64,
+        "moe_balance_coef": 0.02,
+        "gate_temperature": 1.0
+    },
+    "augmentation": {
+        "noise_std": 0.05,
+        "scale_range_min": 0.8,
+        "scale_range_max": 1.2,
+        "mask_prob": 0.2
+    }
+}
