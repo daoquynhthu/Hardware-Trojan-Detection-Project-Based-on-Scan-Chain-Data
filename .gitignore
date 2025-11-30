@@ -13,3 +13,4 @@ venv/
 data/dataset.pkl
 models/lgbm_model.txt
 models/scalers/*.pkl
+model_train.code-workspace
